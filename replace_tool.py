@@ -192,6 +192,7 @@ HANDLERS = {
     ".xlsx": replace_in_xlsx,
     ".docx": replace_in_docx,
     ".txt":  replace_in_txt,
+    ".md":   replace_in_txt,   # txt と同じテキスト処理
 }
 
 
@@ -316,7 +317,7 @@ class ReplaceAllApp:
                         variable=self.recurse_var).pack(side=tk.LEFT)
 
         self.ext_vars: dict[str, tk.BooleanVar] = {}
-        for ext in (".pptx", ".xlsx", ".docx", ".txt"):
+        for ext in (".pptx", ".xlsx", ".docx", ".txt", ".md"):
             v = tk.BooleanVar(value=True)
             self.ext_vars[ext] = v
             ttk.Checkbutton(frm_opt, text=ext, variable=v).pack(side=tk.LEFT, padx=6)
