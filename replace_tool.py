@@ -5,6 +5,7 @@ import os
 import sys
 import re
 import json
+import shutil
 import threading
 from datetime import datetime
 import tkinter as tk
@@ -12,20 +13,19 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 
 # ---------------------------------------------------------------------------
-# 置換ロジック（1パス同時置換）
+# 置換ロジック（1パス同時置換・冪等）
 # ---------------------------------------------------------------------------
 
 def _make_pat(old: str, fullhalf_sensitive: bool) -> str:
-    """old 文字列を正規表現パターン文字列に変換する。"""
     if fullhalf_sensitive:
         return re.escape(old)
     parts = []
     for ch in old:
         code = ord(ch)
-        if 0xFF01 <= code <= 0xFF5E:        # 全角 ASCII → 半角も許容
+        if 0xFF01 <= code <= 0xFF5E:
             half = chr(code - 0xFEE0)
             parts.append(f'(?:{re.escape(ch)}|{re.escape(half)})')
-        elif 0x21 <= code <= 0x7E:          # 半角 ASCII → 全角も許容
+        elif 0x21 <= code <= 0x7E:
             full = chr(code + 0xFEE0)
             parts.append(f'(?:{re.escape(ch)}|{re.escape(full)})')
         elif ch == ' ':
@@ -42,17 +42,9 @@ def build_combined_replacer(pairs_raw: list[tuple[str, str]],
                              fullhalf_sensitive: bool):
     """
     全ペアを 1 本の正規表現で同時処理する冪等な置換関数を返す。
-
-    【問題と解決策】
-        "MS"→"bMS社" のような置換では、出力値 "bMS社" の中に検索パターン "MS"
-        が含まれるため、複数回実行すると bMS社→bbMS社社→… と無限増殖する。
-
-        解決: 全ての置換後の値（new）を「ガードパターン」として正規表現の
-        先頭に登録し、最高優先度でマッチさせる。ガードがマッチした位置は
-        そのまま返す（identity）ので、内部の短いパターンが再ヒットしない。
-        → 何度実行しても同じ結果（冪等性）が保証される。
+    置換後の値をガードパターンとして最優先登録することで、
+    複数回実行しても結果が変わらない冪等性を保証する。
     """
-    # (old文字列, patternStr, new文字列) のタプルで保持
     entries = []
     for old, new in pairs_raw:
         if old:
@@ -61,41 +53,27 @@ def build_combined_replacer(pairs_raw: list[tuple[str, str]],
     if not entries:
         return None
 
-    # 長い old を優先（短いパターンが長いパターンの一部にマッチするのを防止）
-    # 例: "MSFT" > "MS" の順にすることで "MSFT" が "MS" より先にマッチする
     entries.sort(key=lambda e: len(e[0]), reverse=True)
 
     flags = re.UNICODE | (0 if case_sensitive else re.IGNORECASE)
 
-    # --- ガードパターン: 置換後の値を長い順に並べて最優先登録 ---
-    # 既に置換済みのテキスト（例: "bMS社"）がこのパターンにマッチしたら
-    # そのまま返し、内部の短いパターン（"MS"）への再ヒットを防ぐ。
     guard_values = sorted(
         set(new for _, new in pairs_raw if new),
-        key=len, reverse=True,  # 長いものを優先（部分マッチ防止）
+        key=len, reverse=True,
     )
     guard_pats = [re.escape(v) for v in guard_values]
+    guard_set  = {v.lower() for v in guard_values} if not case_sensitive else set(guard_values)
 
-    if not case_sensitive:
-        guard_set = {v.lower() for v in guard_values}
-    else:
-        guard_set = set(guard_values)
-
-    # 各検索パターンを個別コンパイル（マッチ→置換値の逆引き用）
     individual = [(re.compile(f'(?:{pat})', flags), new) for _, pat, new in entries]
-
-    # 組み合わせ正規表現: ガード優先 → 検索パターン（長い順）
-    all_pats = guard_pats + [pat for _, pat, _ in entries]
-    combined = re.compile('|'.join(f'(?:{p})' for p in all_pats), flags)
+    all_pats   = guard_pats + [pat for _, pat, _ in entries]
+    combined   = re.compile('|'.join(f'(?:{p})' for p in all_pats), flags)
 
     def replacer(text: str) -> str:
         def sub(m: re.Match) -> str:
-            s = m.group(0)
-            # ガード判定: 置換後の値にマッチしたらそのまま返す
+            s     = m.group(0)
             s_key = s.lower() if not case_sensitive else s
             if s_key in guard_set:
                 return s
-            # 検索パターンにマッチした場合は置換値を返す
             for irx, new in individual:
                 if irx.fullmatch(s):
                     return new
@@ -105,7 +83,9 @@ def build_combined_replacer(pairs_raw: list[tuple[str, str]],
     return replacer
 
 
-# --- Office ファイル処理 ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# Office / テキスト ファイル処理
+# ---------------------------------------------------------------------------
 
 def _process_text_frame(tf, replacer) -> int:
     count = 0
@@ -118,7 +98,7 @@ def _process_text_frame(tf, replacer) -> int:
     return count
 
 
-def replace_in_pptx(filepath: str, replacer) -> int:
+def replace_in_pptx(filepath: str, replacer, output_path: str = None) -> int:
     from pptx import Presentation
     prs   = Presentation(filepath)
     total = 0
@@ -131,11 +111,13 @@ def replace_in_pptx(filepath: str, replacer) -> int:
                     for cell in row.cells:
                         total += _process_text_frame(cell.text_frame, replacer)
     if total:
-        prs.save(filepath)
+        prs.save(output_path or filepath)
+    elif output_path:
+        shutil.copy2(filepath, output_path)
     return total
 
 
-def replace_in_xlsx(filepath: str, replacer) -> int:
+def replace_in_xlsx(filepath: str, replacer, output_path: str = None) -> int:
     import openpyxl
     wb    = openpyxl.load_workbook(filepath)
     total = 0
@@ -148,11 +130,13 @@ def replace_in_xlsx(filepath: str, replacer) -> int:
                         cell.value = new
                         total += 1
     if total:
-        wb.save(filepath)
+        wb.save(output_path or filepath)
+    elif output_path:
+        shutil.copy2(filepath, output_path)
     return total
 
 
-def replace_in_docx(filepath: str, replacer) -> int:
+def replace_in_docx(filepath: str, replacer, output_path: str = None) -> int:
     from docx import Document
 
     def proc_paras(paragraphs):
@@ -172,15 +156,71 @@ def replace_in_docx(filepath: str, replacer) -> int:
             for cell in row.cells:
                 total += proc_paras(cell.paragraphs)
     if total:
-        doc.save(filepath)
+        doc.save(output_path or filepath)
+    elif output_path:
+        shutil.copy2(filepath, output_path)
     return total
+
+
+_TXT_ENCODINGS = ("utf-8-sig", "utf-8", "cp932", "latin-1")
+
+def replace_in_txt(filepath: str, replacer, output_path: str = None) -> int:
+    text, enc = None, "utf-8"
+    for e in _TXT_ENCODINGS:
+        try:
+            with open(filepath, "r", encoding=e) as f:
+                text = f.read()
+            enc = e
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        raise ValueError("エンコーディングを判別できませんでした")
+
+    new_text = replacer(text)
+    if new_text != text:
+        with open(output_path or filepath, "w", encoding=enc) as f:
+            f.write(new_text)
+        return 1
+    elif output_path:
+        shutil.copy2(filepath, output_path)
+    return 0
 
 
 HANDLERS = {
     ".pptx": replace_in_pptx,
     ".xlsx": replace_in_xlsx,
     ".docx": replace_in_docx,
+    ".txt":  replace_in_txt,
 }
+
+
+# ---------------------------------------------------------------------------
+# pptx → PDF 変換（PowerPoint COM）
+# ---------------------------------------------------------------------------
+
+def convert_pptx_to_pdf(pptx_path: str, pdf_path: str) -> str | None:
+    """
+    Microsoft PowerPoint COM を使って pptx を PDF に変換する。
+    成功時は None、失敗時はエラーメッセージ文字列を返す。
+    """
+    try:
+        import comtypes.client
+    except ImportError:
+        return "comtypes が未インストールです (pip install comtypes)"
+    try:
+        ppt = comtypes.client.CreateObject("PowerPoint.Application")
+        try:
+            ppt.Visible = 1
+            deck = ppt.Presentations.Open(
+                os.path.abspath(pptx_path), ReadOnly=True, WithWindow=False)
+            deck.SaveAs(os.path.abspath(pdf_path), 32)   # 32 = ppSaveAsPDF
+            deck.Close()
+        finally:
+            ppt.Quit()
+        return None
+    except Exception as e:
+        return str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -188,36 +228,23 @@ HANDLERS = {
 # ---------------------------------------------------------------------------
 
 def _strip_json_comments(text: str) -> str:
-    """
-    // 行コメントを除去して純粋な JSON 文字列を返す。
-    文字列リテラル内の // は除去しない。
-    """
-    result = []
-    in_str  = False
-    i = 0
-    n = len(text)
+    result, in_str, i, n = [], False, 0, len(text)
     while i < n:
         c = text[i]
         if c == '\\' and in_str:
-            # エスケープシーケンス: 次の1文字ごとそのまま通す
-            result.append(c)
-            i += 1
+            result.append(c); i += 1
             if i < n:
-                result.append(text[i])
-                i += 1
+                result.append(text[i]); i += 1
             continue
         if c == '"':
             in_str = not in_str
-            result.append(c)
-            i += 1
+            result.append(c); i += 1
             continue
         if not in_str and c == '/' and i + 1 < n and text[i + 1] == '/':
-            # 行末までスキップ
             while i < n and text[i] != '\n':
                 i += 1
             continue
-        result.append(c)
-        i += 1
+        result.append(c); i += 1
     return ''.join(result)
 
 
@@ -226,13 +253,7 @@ def _strip_json_comments(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def parse_pairs(text: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """
-    "置換前=置換後" 形式のテキストをパースする。
-    # 始まりはコメント行、空行はスキップ。
-    戻り値: ([(old, new), ...], [エラーメッセージ, ...])
-    """
-    pairs  = []
-    errors = []
+    pairs, errors = [], []
     for i, line in enumerate(text.splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -249,13 +270,10 @@ def parse_pairs(text: str) -> tuple[list[tuple[str, str]], list[str]]:
 
 
 def pairs_to_text(pairs: list[dict]) -> str:
-    """JSON の pairs リストをテキストエリア用の文字列に変換する。"""
     lines = []
     for p in pairs:
-        old     = p.get("old", "")
-        new     = p.get("new", "")
-        enabled = p.get("enabled", True)
-        line    = f"{old}={new}"
+        old, new, enabled = p.get("old",""), p.get("new",""), p.get("enabled", True)
+        line = f"{old}={new}"
         if not enabled:
             line = f"# {line}"
         lines.append(line)
@@ -270,7 +288,7 @@ class ReplaceAllApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("一括文字置換ツール")
-        self.root.geometry("760x700")
+        self.root.geometry("780x800")
         self.root.resizable(True, True)
         self._build_ui()
 
@@ -298,7 +316,7 @@ class ReplaceAllApp:
                         variable=self.recurse_var).pack(side=tk.LEFT)
 
         self.ext_vars: dict[str, tk.BooleanVar] = {}
-        for ext in (".pptx", ".xlsx", ".docx"):
+        for ext in (".pptx", ".xlsx", ".docx", ".txt"):
             v = tk.BooleanVar(value=True)
             self.ext_vars[ext] = v
             ttk.Checkbutton(frm_opt, text=ext, variable=v).pack(side=tk.LEFT, padx=6)
@@ -307,19 +325,55 @@ class ReplaceAllApp:
         frm_match = ttk.LabelFrame(self.root, text="マッチングオプション")
         frm_match.pack(fill=tk.X, **pad)
 
-        self.case_var     = tk.BooleanVar(value=False)   # デフォ: 区別しない
-        self.fullhalf_var = tk.BooleanVar(value=False)   # デフォ: 区別しない
+        self.case_var     = tk.BooleanVar(value=False)
+        self.fullhalf_var = tk.BooleanVar(value=False)
 
         ttk.Checkbutton(frm_match, text="大文字・小文字を区別する",
                         variable=self.case_var).pack(side=tk.LEFT, padx=8, pady=4)
         ttk.Checkbutton(frm_match, text="全角・半角を区別する",
                         variable=self.fullhalf_var).pack(side=tk.LEFT, padx=8, pady=4)
 
+        # === 出力オプション ===
+        frm_out = ttk.LabelFrame(self.root, text="出力オプション")
+        frm_out.pack(fill=tk.X, **pad)
+
+        # 行1: 別フォルダ出力
+        frm_out1 = ttk.Frame(frm_out)
+        frm_out1.pack(fill=tk.X, padx=4, pady=(4, 2))
+
+        self.out_separate_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm_out1, text="別フォルダに出力する（元ファイルを変更しない）",
+                        variable=self.out_separate_var,
+                        command=self._on_out_toggle).pack(side=tk.LEFT)
+
+        # 行2: 出力先フォルダ
+        frm_out2 = ttk.Frame(frm_out)
+        frm_out2.pack(fill=tk.X, padx=4, pady=(0, 2))
+
+        ttk.Label(frm_out2, text="出力先:").pack(side=tk.LEFT)
+        self.out_dir_var = tk.StringVar()
+        self._out_entry = ttk.Entry(frm_out2, textvariable=self.out_dir_var, width=50)
+        self._out_entry.pack(side=tk.LEFT, padx=(4, 2), fill=tk.X, expand=True)
+        self._out_browse_btn = ttk.Button(frm_out2, text="参照...",
+                                          command=self._browse_out_folder, width=7)
+        self._out_browse_btn.pack(side=tk.LEFT, padx=2)
+
+        # 行3: フォルダ構成
+        frm_out3 = ttk.Frame(frm_out)
+        frm_out3.pack(fill=tk.X, padx=24, pady=(0, 6))
+
+        self.out_structure_var = tk.BooleanVar(value=False)
+        self._out_struct_cb = ttk.Checkbutton(
+            frm_out3, text="フォルダ構成を維持する（未チェック＝フラット出力）",
+            variable=self.out_structure_var)
+        self._out_struct_cb.pack(side=tk.LEFT)
+
+        self._on_out_toggle()
+
         # === ファイル名変更オプション ===
         frm_fname = ttk.LabelFrame(self.root, text="ファイル名変更オプション")
         frm_fname.pack(fill=tk.X, **pad)
 
-        # 行1: 置換ペアをファイル名にも適用
         frm_fname1 = ttk.Frame(frm_fname)
         frm_fname1.pack(fill=tk.X, padx=4, pady=(4, 2))
 
@@ -327,7 +381,6 @@ class ReplaceAllApp:
         ttk.Checkbutton(frm_fname1, text="置換ペアをファイル名にも適用する",
                         variable=self.fname_replace_var).pack(side=tk.LEFT)
 
-        # 行2: プレフィックス / サフィックス追加
         frm_fname2 = ttk.Frame(frm_fname)
         frm_fname2.pack(fill=tk.X, padx=4, pady=(2, 6))
 
@@ -348,7 +401,18 @@ class ReplaceAllApp:
         self._fname_entry = ttk.Entry(frm_fname2, textvariable=self.fname_str_var, width=28)
         self._fname_entry.pack(side=tk.LEFT, padx=2)
 
-        self._on_fname_add_toggle()   # 初期状態: 無効化
+        self._on_fname_add_toggle()
+
+        # === 変換オプション ===
+        frm_conv = ttk.LabelFrame(self.root, text="変換オプション")
+        frm_conv.pack(fill=tk.X, **pad)
+
+        self.pdf_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_conv,
+            text="pptx を PDF に変換する  ※ Microsoft PowerPoint のインストールが必要",
+            variable=self.pdf_var,
+        ).pack(side=tk.LEFT, padx=8, pady=4)
 
         # === 置換ペア ===
         frm_pairs = ttk.LabelFrame(
@@ -360,10 +424,8 @@ class ReplaceAllApp:
         self.pairs_text.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.pairs_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
         self.pairs_text.insert("1.0", "# 例: 旧文字=新文字\n")
 
-        # プリセットボタン
         frm_preset = ttk.Frame(frm_pairs)
         frm_preset.pack(fill=tk.X, padx=4, pady=(0, 4))
 
@@ -405,7 +467,21 @@ class ReplaceAllApp:
         self.log_text.tag_config("head",  foreground="#000000",
                                   font=("Consolas", 9, "bold"))
 
-    # ---- ファイル名オプション ----------------------------------------------
+    # ---- 出力オプション トグル -----------------------------------------------
+
+    def _on_out_toggle(self):
+        enabled = self.out_separate_var.get()
+        state   = tk.NORMAL if enabled else tk.DISABLED
+        self._out_entry.config(state=state)
+        self._out_browse_btn.config(state=state)
+        self._out_struct_cb.config(state=state)
+
+    def _browse_out_folder(self):
+        folder = filedialog.askdirectory(title="出力先フォルダを選択")
+        if folder:
+            self.out_dir_var.set(folder)
+
+    # ---- ファイル名オプション トグル ------------------------------------------
 
     def _on_fname_add_toggle(self):
         state = tk.NORMAL if self.fname_add_var.get() else tk.DISABLED
@@ -437,14 +513,6 @@ class ReplaceAllApp:
         if not path:
             return
 
-        data = {
-            "version": 1,
-            "case_sensitive":     self.case_var.get(),
-            "fullhalf_sensitive": self.fullhalf_var.get(),
-            "pairs": [{"enabled": True, "old": o, "new": n} for o, n in pairs_raw],
-        }
-
-        # # 行（無効化ペア）も enabled:false で保存
         all_pairs = []
         for line in raw.splitlines():
             stripped = line.strip()
@@ -461,8 +529,12 @@ class ReplaceAllApp:
                 if o:
                     all_pairs.append({"enabled": True, "old": o, "new": n})
 
-        data["pairs"] = all_pairs
-
+        data = {
+            "version": 1,
+            "case_sensitive":     self.case_var.get(),
+            "fullhalf_sensitive": self.fullhalf_var.get(),
+            "pairs": all_pairs,
+        }
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -480,18 +552,16 @@ class ReplaceAllApp:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw_text = f.read()
-            cleaned = _strip_json_comments(raw_text)
-            data = json.loads(cleaned)
+            data = json.loads(_strip_json_comments(raw_text))
         except json.JSONDecodeError as e:
-            messagebox.showerror("JSON 解析エラー",
-                                 f"JSON の形式が正しくありません:\n{e}")
+            messagebox.showerror("JSON 解析エラー", f"JSON の形式が正しくありません:\n{e}")
             return
         except Exception as e:
             messagebox.showerror("読込エラー", str(e))
             return
 
-        self.case_var.set(data.get("case_sensitive", True))
-        self.fullhalf_var.set(data.get("fullhalf_sensitive", True))
+        self.case_var.set(data.get("case_sensitive", False))
+        self.fullhalf_var.set(data.get("fullhalf_sensitive", False))
 
         text = pairs_to_text(data.get("pairs", []))
         self.pairs_text.delete("1.0", tk.END)
@@ -538,28 +608,22 @@ class ReplaceAllApp:
 
     def _run_replacement(self):
         folder = self.folder_var.get().strip()
-        if not folder:
-            messagebox.showerror("エラー", "フォルダを選択してください")
-            return
-        if not os.path.isdir(folder):
-            messagebox.showerror("エラー", "有効なフォルダを指定してください")
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("エラー", "有効なフォルダを選択してください")
             return
 
         raw = self.pairs_text.get("1.0", tk.END)
         pairs_raw, errors = parse_pairs(raw)
-
         if errors:
             messagebox.showerror("入力エラー", "\n".join(errors))
             return
         if not pairs_raw:
-            messagebox.showerror("エラー", "置換ペアを1組以上入力してください\n"
-                                           "（書式: 置換前=置換後）")
+            messagebox.showerror("エラー", "置換ペアを1組以上入力してください\n（書式: 置換前=置換後）")
             return
 
         case_sensitive     = self.case_var.get()
         fullhalf_sensitive = self.fullhalf_var.get()
-
-        replacer = build_combined_replacer(pairs_raw, case_sensitive, fullhalf_sensitive)
+        replacer           = build_combined_replacer(pairs_raw, case_sensitive, fullhalf_sensitive)
         if not replacer:
             messagebox.showerror("エラー", "有効な置換ペアを1組以上入力してください")
             return
@@ -569,36 +633,56 @@ class ReplaceAllApp:
             messagebox.showerror("エラー", "対象拡張子を1つ以上選択してください")
             return
 
+        # 別フォルダ出力の検証
+        out_separate = self.out_separate_var.get()
+        out_dir      = self.out_dir_var.get().strip()
+        if out_separate and not out_dir:
+            messagebox.showerror("エラー", "出力先フォルダを指定してください")
+            return
+
         self.run_btn.config(state=tk.DISABLED)
         self.status_var.set("処理中...")
         self.root.update_idletasks()
 
-        fname_opts = {
-            "apply_replace": self.fname_replace_var.get(),
-            "add_string":    self.fname_add_var.get(),
-            "position":      self.fname_pos_var.get(),
-            "string":        self.fname_str_var.get(),
+        opts = {
+            "case_sensitive":     case_sensitive,
+            "fullhalf_sensitive": fullhalf_sensitive,
+            "recurse":            self.recurse_var.get(),
+            # 出力
+            "out_separate":       out_separate,
+            "out_dir":            out_dir,
+            "out_structure":      self.out_structure_var.get(),
+            # ファイル名
+            "fname_replace":      self.fname_replace_var.get(),
+            "fname_add":          self.fname_add_var.get(),
+            "fname_position":     self.fname_pos_var.get(),
+            "fname_string":       self.fname_str_var.get(),
+            # 変換
+            "pdf_convert":        self.pdf_var.get(),
         }
 
         t = threading.Thread(
             target=self._do_replacement,
-            args=(folder, replacer, pairs_raw, exts,
-                  self.recurse_var.get(), case_sensitive, fullhalf_sensitive,
-                  fname_opts),
+            args=(folder, replacer, pairs_raw, exts, opts),
             daemon=True,
         )
         t.start()
 
-    def _do_replacement(self, folder, replacer, pairs_raw, exts,
-                        recurse, case_sensitive, fullhalf_sensitive, fname_opts):
-        start    = datetime.now()
-        opt_case = "区別する" if case_sensitive else "区別しない"
-        opt_fh   = "区別する" if fullhalf_sensitive else "区別しない"
+    def _do_replacement(self, folder, replacer, pairs_raw, exts, opts):
+        start = datetime.now()
 
-        do_fname_replace = fname_opts["apply_replace"]
-        do_fname_add     = fname_opts["add_string"]
-        fname_position   = fname_opts["position"]    # "prefix" or "suffix"
-        fname_string     = fname_opts["string"]
+        out_separate   = opts["out_separate"]
+        out_dir        = opts["out_dir"]
+        out_structure  = opts["out_structure"]
+        fname_replace  = opts["fname_replace"]
+        fname_add      = opts["fname_add"]
+        fname_position = opts["fname_position"]
+        fname_string   = opts["fname_string"]
+        pdf_convert    = opts["pdf_convert"]
+        recurse        = opts["recurse"]
+
+        opt_case = "区別する" if opts["case_sensitive"] else "区別しない"
+        opt_fh   = "区別する" if opts["fullhalf_sensitive"] else "区別しない"
 
         self.root.after(0, lambda: self._log(f"=== 置換開始: {folder} ===", "head"))
         self.root.after(0, lambda: self._log(
@@ -606,18 +690,19 @@ class ReplaceAllApp:
         self.root.after(0, lambda: self._log(
             f"置換ペア ({len(pairs_raw)}組): " +
             " / ".join(f'"{o}"→"{n}"' for o, n in pairs_raw), "info"))
-        if do_fname_replace:
-            self.root.after(0, lambda: self._log("ファイル名: 置換ペアを適用", "info"))
-        if do_fname_add and fname_string:
-            pos_label = "冒頭" if fname_position == "prefix" else "末尾"
+        if out_separate:
+            mode = "構成維持" if out_structure else "フラット"
             self.root.after(0, lambda: self._log(
-                f"ファイル名: {pos_label}に「{fname_string}」を追加", "info"))
+                f"出力先: {out_dir}  [{mode}]", "info"))
+        if pdf_convert:
+            self.root.after(0, lambda: self._log("PDF変換: 有効", "info"))
 
-        total_files        = 0
-        changed_files      = 0
-        total_replacements = 0
-        renamed_files      = 0
-        error_count        = 0
+        total_files   = 0
+        changed_files = 0
+        total_reps    = 0
+        renamed_files = 0
+        pdf_count     = 0
+        error_count   = 0
 
         walker = os.walk(folder) if recurse else [(folder, [], os.listdir(folder))]
 
@@ -630,15 +715,24 @@ class ReplaceAllApp:
                 fpath = os.path.join(dirpath, fname)
                 rel   = os.path.relpath(fpath, folder)
 
+                # --- 出力パスの決定 ---
+                if out_separate and out_dir:
+                    if out_structure:
+                        out_path = os.path.join(out_dir, rel)
+                    else:
+                        out_path = os.path.join(out_dir, fname)
+                    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+                else:
+                    out_path = None   # 上書き
+
                 # --- 内容の置換 ---
                 handler = HANDLERS[ext.lower()]
-                content_n = 0
                 try:
-                    content_n = handler(fpath, replacer)
-                    if content_n:
-                        changed_files      += 1
-                        total_replacements += content_n
-                        msg, tag = f"[変更]    {rel}  ({content_n}箇所)", "ok"
+                    n = handler(fpath, replacer, out_path)
+                    if n:
+                        changed_files += 1
+                        total_reps    += n
+                        msg, tag = f"[変更]    {rel}  ({n}箇所)", "ok"
                     else:
                         msg, tag = f"[変更なし] {rel}", "skip"
                 except Exception as e:
@@ -647,11 +741,27 @@ class ReplaceAllApp:
 
                 self.root.after(0, lambda m=msg, t=tag: self._log(m, t))
 
+                # 以降のファイル名操作・PDF変換は実際のファイルパスに対して行う
+                target_path = out_path or fpath
+
+                # --- PDF変換（pptx のみ）---
+                if pdf_convert and ext.lower() == ".pptx":
+                    pdf_path = os.path.splitext(target_path)[0] + ".pdf"
+                    err = convert_pptx_to_pdf(target_path, pdf_path)
+                    if err:
+                        error_count += 1
+                        pmsg = f"[PDF変換エラー] {rel}: {err}"
+                        self.root.after(0, lambda m=pmsg: self._log(m, "error"))
+                    else:
+                        pdf_count += 1
+                        pmsg = f"[PDF変換]  {os.path.relpath(pdf_path, folder if not out_separate else out_dir)}"
+                        self.root.after(0, lambda m=pmsg: self._log(m, "ok"))
+
                 # --- ファイル名の変更 ---
                 new_stem = stem
-                if do_fname_replace:
+                if fname_replace:
                     new_stem = replacer(new_stem)
-                if do_fname_add and fname_string:
+                if fname_add and fname_string:
                     if fname_position == "prefix":
                         if not new_stem.startswith(fname_string):
                             new_stem = fname_string + new_stem
@@ -661,16 +771,15 @@ class ReplaceAllApp:
 
                 if new_stem != stem:
                     new_fname = new_stem + ext
-                    new_fpath = os.path.join(dirpath, new_fname)
+                    new_target = os.path.join(os.path.dirname(target_path), new_fname)
                     try:
-                        if os.path.exists(new_fpath):
+                        if os.path.exists(new_target):
                             rmsg = f"[名前変更スキップ] {rel} → {new_fname}（同名ファイルが存在）"
                             self.root.after(0, lambda m=rmsg: self._log(m, "error"))
                         else:
-                            os.rename(fpath, new_fpath)
+                            os.rename(target_path, new_target)
                             renamed_files += 1
-                            new_rel = os.path.relpath(new_fpath, folder)
-                            rmsg = f"[名前変更]  {rel} → {new_rel}"
+                            rmsg = f"[名前変更]  {os.path.basename(target_path)} → {new_fname}"
                             self.root.after(0, lambda m=rmsg: self._log(m, "ok"))
                     except Exception as e:
                         error_count += 1
@@ -681,12 +790,12 @@ class ReplaceAllApp:
         summary = (
             f"=== 完了 ({elapsed:.1f}秒)  "
             f"対象:{total_files}件  内容変更:{changed_files}件  "
-            f"置換:{total_replacements}箇所  名前変更:{renamed_files}件  "
-            f"エラー:{error_count}件 ==="
+            f"置換:{total_reps}箇所  名前変更:{renamed_files}件  "
+            f"PDF変換:{pdf_count}件  エラー:{error_count}件 ==="
         )
         self.root.after(0, lambda: self._log(summary, "head"))
         self.root.after(0, lambda: self.status_var.set(
-            f"完了 — 内容:{changed_files}/{total_files}件変更  名前:{renamed_files}件変更"))
+            f"完了 — 変更:{changed_files}/{total_files}  名前:{renamed_files}  PDF:{pdf_count}"))
         self.root.after(0, lambda: self.run_btn.config(state=tk.NORMAL))
 
 
