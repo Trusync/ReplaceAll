@@ -1,0 +1,5 @@
+# PyInstaller 中間ファイル
+build/
+*.spec
+__pycache__/
+*.py[cod]
