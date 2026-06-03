@@ -617,16 +617,12 @@ class ReplaceAllApp:
         if errors:
             messagebox.showerror("入力エラー", "\n".join(errors))
             return
-        if not pairs_raw:
-            messagebox.showerror("エラー", "置換ペアを1組以上入力してください\n（書式: 置換前=置換後）")
-            return
 
         case_sensitive     = self.case_var.get()
         fullhalf_sensitive = self.fullhalf_var.get()
-        replacer           = build_combined_replacer(pairs_raw, case_sensitive, fullhalf_sensitive)
-        if not replacer:
-            messagebox.showerror("エラー", "有効な置換ペアを1組以上入力してください")
-            return
+        # 置換ペア未入力の場合は恒等関数（コピー・PDF変換のみ実行）
+        replacer = build_combined_replacer(pairs_raw, case_sensitive, fullhalf_sensitive) \
+                   or (lambda text: text)
 
         exts = [e for e, v in self.ext_vars.items() if v.get()]
         if not exts:
