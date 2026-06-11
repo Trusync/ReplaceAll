@@ -11,6 +11,36 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
+try:
+    from tkinterdnd2 import TkinterDnD as _TkinterDnD, DND_FILES as _DND_FILES
+    _DND_AVAILABLE = True
+except ImportError:
+    _TkinterDnD = None
+    _DND_FILES   = None
+    _DND_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# フォルダ履歴
+# ---------------------------------------------------------------------------
+
+_HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".replace_tool_history.json")
+_HISTORY_MAX  = 8
+
+def _load_history() -> list:
+    try:
+        with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("folders", [])
+    except Exception:
+        return []
+
+def _save_history(folders: list) -> None:
+    try:
+        with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"folders": folders}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # 置換ロジック（1パス同時置換・冪等）
@@ -346,10 +376,15 @@ class ReplaceAllApp:
         frm_folder.pack(fill=tk.X, **p)
 
         self.folder_var = tk.StringVar()
-        ttk.Entry(frm_folder, textvariable=self.folder_var).pack(
-            side=tk.LEFT, padx=4, pady=4, fill=tk.X, expand=True)
+        self._folder_cb = ttk.Combobox(frm_folder, textvariable=self.folder_var,
+                                       values=_load_history())
+        self._folder_cb.pack(side=tk.LEFT, padx=4, pady=4, fill=tk.X, expand=True)
         ttk.Button(frm_folder, text="参照...", command=self._browse_folder).pack(
             side=tk.LEFT, padx=4, pady=4)
+        if _DND_AVAILABLE:
+            self._folder_cb.drop_target_register(_DND_FILES)
+            self._folder_cb.dnd_bind("<<Drop>>",
+                lambda e: self._on_dir_drop(e, self.folder_var))
 
         # === 対象オプション ===
         frm_opt = ttk.Frame(left)
@@ -399,6 +434,10 @@ class ReplaceAllApp:
         self._out_browse_btn = ttk.Button(frm_out2, text="参照...",
                                           command=self._browse_out_folder, width=7)
         self._out_browse_btn.pack(side=tk.LEFT, padx=2)
+        if _DND_AVAILABLE:
+            self._out_entry.drop_target_register(_DND_FILES)
+            self._out_entry.dnd_bind("<<Drop>>",
+                lambda e: self._on_dir_drop(e, self.out_dir_var))
 
         frm_out3 = ttk.Frame(frm_out)
         frm_out3.pack(fill=tk.X, padx=22, pady=(0, 6))
@@ -496,7 +535,16 @@ class ReplaceAllApp:
         self.pairs_text.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.pairs_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.pairs_text.tag_config("ph_old",     foreground="#1a5fb4")
+        self.pairs_text.tag_config("ph_sep",     foreground="#999999")
+        self.pairs_text.tag_config("ph_new",     foreground="#26a269")
+        self.pairs_text.tag_config("ph_comment", foreground="#aaaaaa",
+                                   font=("Consolas", 10, "italic"))
+
         self.pairs_text.insert("1.0", "# 例: 旧文字=新文字\n")
+        self.pairs_text.bind("<KeyRelease>", self._schedule_highlight)
+        self.root.after(50, self._highlight_pairs)
 
         frm_preset = ttk.Frame(frm_pairs)
         frm_preset.pack(fill=tk.X, padx=4, pady=(0, 4))
@@ -523,6 +571,12 @@ class ReplaceAllApp:
         self.status_var = tk.StringVar(value="待機中")
         ttk.Label(frm_run, textvariable=self.status_var,
                   foreground="gray").pack(side=tk.RIGHT, padx=8)
+
+        # === プログレスバー ===
+        self.progress_var = tk.IntVar(value=0)
+        self._progress_bar = ttk.Progressbar(
+            right, variable=self.progress_var, maximum=100, mode="determinate")
+        self._progress_bar.pack(fill=tk.X, padx=6, pady=(0, 3))
 
         # === ログ ===
         frm_log = ttk.LabelFrame(right, text="処理ログ")
@@ -560,6 +614,46 @@ class ReplaceAllApp:
         self._rb_prefix.config(state=state)
         self._rb_suffix.config(state=state)
         self._fname_entry.config(state=state)
+
+    # ---- ドラッグ&ドロップ ---------------------------------------------------
+
+    def _on_dir_drop(self, event, var: tk.StringVar):
+        raw = event.data.strip()
+        # Windows: 複数パスは {} で囲まれる場合がある
+        paths = re.findall(r'\{([^}]+)\}|(\S+)', raw)
+        path = next((a or b for a, b in paths), "").strip()
+        if os.path.isdir(path):
+            var.set(path)
+
+    # ---- 置換ペアのハイライト ------------------------------------------------
+
+    def _schedule_highlight(self, event=None):
+        if hasattr(self, "_highlight_job"):
+            self.root.after_cancel(self._highlight_job)
+        self._highlight_job = self.root.after(120, self._highlight_pairs)
+
+    def _highlight_pairs(self):
+        t = self.pairs_text
+        for tag in ("ph_old", "ph_sep", "ph_new", "ph_comment"):
+            t.tag_remove(tag, "1.0", tk.END)
+        for i, line in enumerate(t.get("1.0", tk.END).splitlines(), 1):
+            if not line.strip():
+                continue
+            if line.strip().startswith("#"):
+                t.tag_add("ph_comment", f"{i}.0", f"{i}.end")
+            elif "=" in line:
+                eq = line.index("=")
+                t.tag_add("ph_old", f"{i}.0",      f"{i}.{eq}")
+                t.tag_add("ph_sep", f"{i}.{eq}",   f"{i}.{eq+1}")
+                t.tag_add("ph_new", f"{i}.{eq+1}", f"{i}.end")
+
+    # ---- フォルダ履歴 --------------------------------------------------------
+
+    def _update_history(self, folder: str):
+        history = [folder] + [h for h in _load_history() if h != folder]
+        history = history[:_HISTORY_MAX]
+        _save_history(history)
+        self._folder_cb["values"] = history
 
     # ---- 変換オプション トグル -----------------------------------------------
 
@@ -805,6 +899,20 @@ class ReplaceAllApp:
         master_count  = 0
         error_count   = 0
 
+        # プログレスバー用に対象ファイル数を先行カウント
+        _pre = os.walk(folder) if recurse else [(folder, [], os.listdir(folder))]
+        total_to_process = sum(
+            1 for _dp, _, _fns in _pre
+            for _fn in _fns if os.path.splitext(_fn)[1].lower() in exts
+        )
+        self.root.after(0, lambda n=max(total_to_process, 1):
+                        self._progress_bar.config(maximum=n))
+        self.root.after(0, lambda: self.progress_var.set(0))
+
+        # 履歴を更新
+        self.root.after(0, lambda: self._update_history(folder))
+
+        processed = 0
         walker = os.walk(folder) if recurse else [(folder, [], os.listdir(folder))]
 
         for dirpath, _, filenames in walker:
@@ -813,6 +921,9 @@ class ReplaceAllApp:
                 if ext.lower() not in exts:
                     continue
                 total_files += 1
+                processed += 1
+                _p = processed
+                self.root.after(0, lambda v=_p: self.progress_var.set(v))
                 fpath = os.path.join(dirpath, fname)
                 rel   = os.path.relpath(fpath, folder)
 
@@ -918,6 +1029,7 @@ class ReplaceAllApp:
         self.root.after(0, lambda: self._log(summary, "head"))
         self.root.after(0, lambda: self.status_var.set(
             f"完了 — 変更:{changed_files}/{total_files}  名前:{renamed_files}  PDF:{pdf_count}  マスタ:{master_count}"))
+        self.root.after(0, lambda: self.progress_var.set(0))
         self.root.after(0, lambda: self.run_btn.config(state=tk.NORMAL))
 
 
@@ -944,6 +1056,6 @@ if __name__ == "__main__":
         print(f"  pip install {' '.join(missing)}")
         sys.exit(1)
 
-    root = tk.Tk()
+    root = _TkinterDnD.Tk() if _DND_AVAILABLE else tk.Tk()
     ReplaceAllApp(root)
     root.mainloop()
