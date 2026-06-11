@@ -197,8 +197,34 @@ HANDLERS = {
 
 
 # ---------------------------------------------------------------------------
-# pptx → PDF 変換（PowerPoint COM）
+# pptx → PDF 変換 / スライドマスタ置換（PowerPoint COM）
 # ---------------------------------------------------------------------------
+
+def apply_slide_master(pptx_path: str, template_path: str, output_path: str = None) -> str | None:
+    """
+    PowerPoint COM を使ってスライドマスタをテンプレート (.pptx/.potx) から適用する。
+    成功時は None、失敗時はエラーメッセージ文字列を返す。
+    """
+    try:
+        import comtypes.client
+    except ImportError:
+        return "comtypes が未インストールです (pip install comtypes)"
+    try:
+        ppt = comtypes.client.CreateObject("PowerPoint.Application")
+        try:
+            ppt.Visible = 1
+            deck = ppt.Presentations.Open(
+                os.path.abspath(pptx_path), ReadOnly=False, WithWindow=False)
+            deck.ApplyTemplate(os.path.abspath(template_path))
+            save_path = os.path.abspath(output_path or pptx_path)
+            deck.SaveAs(save_path, 24)   # 24 = ppSaveAsOpenXMLPresentation
+            deck.Close()
+        finally:
+            ppt.Quit()
+        return None
+    except Exception as e:
+        return str(e)
+
 
 def convert_pptx_to_pdf(pptx_path: str, pdf_path: str) -> str | None:
     """
@@ -289,42 +315,59 @@ class ReplaceAllApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("一括文字置換ツール")
-        self.root.geometry("780x800")
+        self.root.geometry("1280x720")
         self.root.resizable(True, True)
         self._build_ui()
 
     # ---- UI 構築 -----------------------------------------------------------
 
     def _build_ui(self):
-        pad = {"padx": 8, "pady": 3}
+        p = {"padx": 6, "pady": 3}
+
+        # ── 2列メインフレーム ──────────────────────────────────────────────────
+        main = ttk.Frame(self.root)
+        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        # 左列：オプション群（固定幅）
+        left = ttk.Frame(main, width=550)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        left.pack_propagate(False)
+
+        # 右列：置換ペア・ログ（可変幅）
+        right = ttk.Frame(main)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # ══════════════════════════════════════════
+        # 左列
+        # ══════════════════════════════════════════
 
         # === フォルダ選択 ===
-        frm_folder = ttk.LabelFrame(self.root, text="対象フォルダ")
-        frm_folder.pack(fill=tk.X, **pad)
+        frm_folder = ttk.LabelFrame(left, text="対象フォルダ")
+        frm_folder.pack(fill=tk.X, **p)
 
         self.folder_var = tk.StringVar()
-        ttk.Entry(frm_folder, textvariable=self.folder_var, width=62).pack(
+        ttk.Entry(frm_folder, textvariable=self.folder_var).pack(
             side=tk.LEFT, padx=4, pady=4, fill=tk.X, expand=True)
         ttk.Button(frm_folder, text="参照...", command=self._browse_folder).pack(
             side=tk.LEFT, padx=4, pady=4)
 
         # === 対象オプション ===
-        frm_opt = ttk.Frame(self.root)
-        frm_opt.pack(fill=tk.X, **pad)
+        frm_opt = ttk.Frame(left)
+        frm_opt.pack(fill=tk.X, **p)
 
         self.recurse_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_opt, text="サブフォルダを含める",
                         variable=self.recurse_var).pack(side=tk.LEFT)
 
         self.ext_vars: dict[str, tk.BooleanVar] = {}
-        for ext in (".pptx", ".xlsx", ".docx", ".txt", ".md"):
+        for _ext in (".pptx", ".xlsx", ".docx", ".txt", ".md"):
             v = tk.BooleanVar(value=True)
-            self.ext_vars[ext] = v
-            ttk.Checkbutton(frm_opt, text=ext, variable=v).pack(side=tk.LEFT, padx=6)
+            self.ext_vars[_ext] = v
+            ttk.Checkbutton(frm_opt, text=_ext, variable=v).pack(side=tk.LEFT, padx=4)
 
         # === マッチングオプション ===
-        frm_match = ttk.LabelFrame(self.root, text="マッチングオプション")
-        frm_match.pack(fill=tk.X, **pad)
+        frm_match = ttk.LabelFrame(left, text="マッチングオプション")
+        frm_match.pack(fill=tk.X, **p)
 
         self.case_var     = tk.BooleanVar(value=False)
         self.fullhalf_var = tk.BooleanVar(value=False)
@@ -335,10 +378,9 @@ class ReplaceAllApp:
                         variable=self.fullhalf_var).pack(side=tk.LEFT, padx=8, pady=4)
 
         # === 出力オプション ===
-        frm_out = ttk.LabelFrame(self.root, text="出力オプション")
-        frm_out.pack(fill=tk.X, **pad)
+        frm_out = ttk.LabelFrame(left, text="出力オプション")
+        frm_out.pack(fill=tk.X, **p)
 
-        # 行1: 別フォルダ出力
         frm_out1 = ttk.Frame(frm_out)
         frm_out1.pack(fill=tk.X, padx=4, pady=(4, 2))
 
@@ -347,21 +389,19 @@ class ReplaceAllApp:
                         variable=self.out_separate_var,
                         command=self._on_out_toggle).pack(side=tk.LEFT)
 
-        # 行2: 出力先フォルダ
         frm_out2 = ttk.Frame(frm_out)
         frm_out2.pack(fill=tk.X, padx=4, pady=(0, 2))
 
         ttk.Label(frm_out2, text="出力先:").pack(side=tk.LEFT)
         self.out_dir_var = tk.StringVar()
-        self._out_entry = ttk.Entry(frm_out2, textvariable=self.out_dir_var, width=50)
+        self._out_entry = ttk.Entry(frm_out2, textvariable=self.out_dir_var)
         self._out_entry.pack(side=tk.LEFT, padx=(4, 2), fill=tk.X, expand=True)
         self._out_browse_btn = ttk.Button(frm_out2, text="参照...",
                                           command=self._browse_out_folder, width=7)
         self._out_browse_btn.pack(side=tk.LEFT, padx=2)
 
-        # 行3: フォルダ構成
         frm_out3 = ttk.Frame(frm_out)
-        frm_out3.pack(fill=tk.X, padx=24, pady=(0, 6))
+        frm_out3.pack(fill=tk.X, padx=22, pady=(0, 6))
 
         self.out_structure_var = tk.BooleanVar(value=False)
         self._out_struct_cb = ttk.Checkbutton(
@@ -372,8 +412,8 @@ class ReplaceAllApp:
         self._on_out_toggle()
 
         # === ファイル名変更オプション ===
-        frm_fname = ttk.LabelFrame(self.root, text="ファイル名変更オプション")
-        frm_fname.pack(fill=tk.X, **pad)
+        frm_fname = ttk.LabelFrame(left, text="ファイル名変更オプション")
+        frm_fname.pack(fill=tk.X, **p)
 
         frm_fname1 = ttk.Frame(frm_fname)
         frm_fname1.pack(fill=tk.X, padx=4, pady=(4, 2))
@@ -395,30 +435,61 @@ class ReplaceAllApp:
                                           variable=self.fname_pos_var, value="prefix")
         self._rb_suffix = ttk.Radiobutton(frm_fname2, text="末尾",
                                           variable=self.fname_pos_var, value="suffix")
-        self._rb_prefix.pack(side=tk.LEFT, padx=(12, 2))
-        self._rb_suffix.pack(side=tk.LEFT, padx=(0, 6))
+        self._rb_prefix.pack(side=tk.LEFT, padx=(10, 2))
+        self._rb_suffix.pack(side=tk.LEFT, padx=(0, 4))
 
         self.fname_str_var = tk.StringVar(value="【マスキング済】")
-        self._fname_entry = ttk.Entry(frm_fname2, textvariable=self.fname_str_var, width=28)
+        self._fname_entry = ttk.Entry(frm_fname2, textvariable=self.fname_str_var, width=22)
         self._fname_entry.pack(side=tk.LEFT, padx=2)
 
         self._on_fname_add_toggle()
 
         # === 変換オプション ===
-        frm_conv = ttk.LabelFrame(self.root, text="変換オプション")
-        frm_conv.pack(fill=tk.X, **pad)
+        frm_conv = ttk.LabelFrame(left, text="変換オプション")
+        frm_conv.pack(fill=tk.X, **p)
+
+        frm_conv1 = ttk.Frame(frm_conv)
+        frm_conv1.pack(fill=tk.X, padx=4, pady=(4, 2))
 
         self.pdf_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frm_conv,
-            text="pptx を PDF に変換する  ※ Microsoft PowerPoint のインストールが必要",
+            frm_conv1,
+            text="pptx を PDF に変換する  ※ PowerPoint 必要",
             variable=self.pdf_var,
-        ).pack(side=tk.LEFT, padx=8, pady=4)
+        ).pack(side=tk.LEFT, padx=4)
+
+        frm_conv2 = ttk.Frame(frm_conv)
+        frm_conv2.pack(fill=tk.X, padx=4, pady=(2, 2))
+
+        self.master_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_conv2,
+            text="スライドマスタを置換する  ※ PowerPoint 必要",
+            variable=self.master_var,
+            command=self._on_master_toggle,
+        ).pack(side=tk.LEFT, padx=4)
+
+        frm_conv3 = ttk.Frame(frm_conv)
+        frm_conv3.pack(fill=tk.X, padx=22, pady=(0, 6))
+
+        ttk.Label(frm_conv3, text="テンプレート:").pack(side=tk.LEFT)
+        self.master_tmpl_var = tk.StringVar()
+        self._master_entry = ttk.Entry(frm_conv3, textvariable=self.master_tmpl_var)
+        self._master_entry.pack(side=tk.LEFT, padx=(4, 2), fill=tk.X, expand=True)
+        self._master_browse_btn = ttk.Button(frm_conv3, text="参照...",
+                                             command=self._browse_template, width=7)
+        self._master_browse_btn.pack(side=tk.LEFT, padx=2)
+
+        self._on_master_toggle()
+
+        # ══════════════════════════════════════════
+        # 右列
+        # ══════════════════════════════════════════
 
         # === 置換ペア ===
         frm_pairs = ttk.LabelFrame(
-            self.root, text="置換ペア  （書式: 置換前=置換後、1行1組、# でコメント）")
-        frm_pairs.pack(fill=tk.BOTH, expand=True, **pad)
+            right, text="置換ペア  （書式: 置換前=置換後、1行1組、# でコメント）")
+        frm_pairs.pack(fill=tk.BOTH, expand=True, **p)
 
         self.pairs_text = tk.Text(frm_pairs, font=("Consolas", 10), undo=True)
         sb = ttk.Scrollbar(frm_pairs, command=self.pairs_text.yview)
@@ -438,8 +509,8 @@ class ReplaceAllApp:
                    command=self._clear_pairs, width=9).pack(side=tk.LEFT, padx=2)
 
         # === 実行ボタン群 ===
-        frm_run = ttk.Frame(self.root)
-        frm_run.pack(fill=tk.X, **pad)
+        frm_run = ttk.Frame(right)
+        frm_run.pack(fill=tk.X, **p)
 
         self.run_btn = ttk.Button(frm_run, text="▶ 置換実行",
                                   command=self._run_replacement)
@@ -454,8 +525,8 @@ class ReplaceAllApp:
                   foreground="gray").pack(side=tk.RIGHT, padx=8)
 
         # === ログ ===
-        frm_log = ttk.LabelFrame(self.root, text="処理ログ")
-        frm_log.pack(fill=tk.BOTH, expand=True, **pad)
+        frm_log = ttk.LabelFrame(right, text="処理ログ")
+        frm_log.pack(fill=tk.BOTH, expand=True, **p)
 
         self.log_text = scrolledtext.ScrolledText(
             frm_log, font=("Consolas", 9), state=tk.DISABLED, height=8)
@@ -489,6 +560,24 @@ class ReplaceAllApp:
         self._rb_prefix.config(state=state)
         self._rb_suffix.config(state=state)
         self._fname_entry.config(state=state)
+
+    # ---- 変換オプション トグル -----------------------------------------------
+
+    def _on_master_toggle(self):
+        state = tk.NORMAL if self.master_var.get() else tk.DISABLED
+        self._master_entry.config(state=state)
+        self._master_browse_btn.config(state=state)
+
+    def _browse_template(self):
+        path = filedialog.askopenfilename(
+            title="テンプレートファイルを選択（.pptx / .potx）",
+            filetypes=[
+                ("PowerPoint ファイル", "*.pptx *.potx"),
+                ("すべてのファイル", "*.*"),
+            ],
+        )
+        if path:
+            self.master_tmpl_var.set(path)
 
     # ---- ペア操作 ----------------------------------------------------------
 
@@ -637,6 +726,16 @@ class ReplaceAllApp:
             messagebox.showerror("エラー", "出力先フォルダを指定してください")
             return
 
+        # スライドマスタ置換の検証
+        master_apply    = self.master_var.get()
+        master_template = self.master_tmpl_var.get().strip()
+        if master_apply and not master_template:
+            messagebox.showerror("エラー", "スライドマスタ置換のテンプレートファイルを指定してください")
+            return
+        if master_apply and not os.path.isfile(master_template):
+            messagebox.showerror("エラー", f"テンプレートファイルが見つかりません:\n{master_template}")
+            return
+
         self.run_btn.config(state=tk.DISABLED)
         self.status_var.set("処理中...")
         self.root.update_idletasks()
@@ -656,6 +755,8 @@ class ReplaceAllApp:
             "fname_string":       self.fname_str_var.get(),
             # 変換
             "pdf_convert":        self.pdf_var.get(),
+            "master_apply":       master_apply,
+            "master_template":    master_template,
         }
 
         t = threading.Thread(
@@ -668,15 +769,17 @@ class ReplaceAllApp:
     def _do_replacement(self, folder, replacer, pairs_raw, exts, opts):
         start = datetime.now()
 
-        out_separate   = opts["out_separate"]
-        out_dir        = opts["out_dir"]
-        out_structure  = opts["out_structure"]
-        fname_replace  = opts["fname_replace"]
-        fname_add      = opts["fname_add"]
-        fname_position = opts["fname_position"]
-        fname_string   = opts["fname_string"]
-        pdf_convert    = opts["pdf_convert"]
-        recurse        = opts["recurse"]
+        out_separate    = opts["out_separate"]
+        out_dir         = opts["out_dir"]
+        out_structure   = opts["out_structure"]
+        fname_replace   = opts["fname_replace"]
+        fname_add       = opts["fname_add"]
+        fname_position  = opts["fname_position"]
+        fname_string    = opts["fname_string"]
+        pdf_convert     = opts["pdf_convert"]
+        master_apply    = opts["master_apply"]
+        master_template = opts["master_template"]
+        recurse         = opts["recurse"]
 
         opt_case = "区別する" if opts["case_sensitive"] else "区別しない"
         opt_fh   = "区別する" if opts["fullhalf_sensitive"] else "区別しない"
@@ -699,6 +802,7 @@ class ReplaceAllApp:
         total_reps    = 0
         renamed_files = 0
         pdf_count     = 0
+        master_count  = 0
         error_count   = 0
 
         walker = os.walk(folder) if recurse else [(folder, [], os.listdir(folder))]
@@ -741,20 +845,19 @@ class ReplaceAllApp:
                 # 以降のファイル名操作・PDF変換は実際のファイルパスに対して行う
                 target_path = out_path or fpath
 
-                # --- PDF変換（pptx のみ）---
-                if pdf_convert and ext.lower() == ".pptx":
-                    pdf_path = os.path.splitext(target_path)[0] + ".pdf"
-                    err = convert_pptx_to_pdf(target_path, pdf_path)
+                # --- スライドマスタ置換（pptx のみ）---
+                if master_apply and ext.lower() == ".pptx":
+                    err = apply_slide_master(target_path, master_template)
                     if err:
                         error_count += 1
-                        pmsg = f"[PDF変換エラー] {rel}: {err}"
-                        self.root.after(0, lambda m=pmsg: self._log(m, "error"))
+                        mmsg = f"[マスタ置換エラー] {rel}: {err}"
+                        self.root.after(0, lambda m=mmsg: self._log(m, "error"))
                     else:
-                        pdf_count += 1
-                        pmsg = f"[PDF変換]  {os.path.relpath(pdf_path, folder if not out_separate else out_dir)}"
-                        self.root.after(0, lambda m=pmsg: self._log(m, "ok"))
+                        master_count += 1
+                        mmsg = f"[マスタ置換]  {os.path.basename(target_path)}"
+                        self.root.after(0, lambda m=mmsg: self._log(m, "ok"))
 
-                # --- ファイル名の変更 ---
+                # --- ファイル名の計算（PDF変換前に確定させる）---
                 new_stem = stem
                 if fname_replace:
                     new_stem = replacer(new_stem)
@@ -766,7 +869,29 @@ class ReplaceAllApp:
                         if not new_stem.endswith(fname_string):
                             new_stem = new_stem + fname_string
 
-                if new_stem != stem:
+                # --- PDF変換（pptx のみ）---
+                pdf_converted = False
+                if pdf_convert and ext.lower() == ".pptx":
+                    pdf_path = os.path.join(os.path.dirname(target_path), new_stem + ".pdf")
+                    err = convert_pptx_to_pdf(target_path, pdf_path)
+                    if err:
+                        error_count += 1
+                        pmsg = f"[PDF変換エラー] {rel}: {err}"
+                        self.root.after(0, lambda m=pmsg: self._log(m, "error"))
+                    else:
+                        pdf_count += 1
+                        pdf_converted = True
+                        pmsg = f"[PDF変換]  {os.path.relpath(pdf_path, folder if not out_separate else out_dir)}"
+                        self.root.after(0, lambda m=pmsg: self._log(m, "ok"))
+                        try:
+                            os.remove(target_path)
+                        except Exception as e:
+                            error_count += 1
+                            rmsg = f"[pptx削除エラー] {os.path.basename(target_path)}: {e}"
+                            self.root.after(0, lambda m=rmsg: self._log(m, "error"))
+
+                # --- ファイル名の変更（PDF変換済みの場合はpptxが削除済みのためスキップ）---
+                if not pdf_converted and new_stem != stem:
                     new_fname = new_stem + ext
                     new_target = os.path.join(os.path.dirname(target_path), new_fname)
                     try:
@@ -788,11 +913,11 @@ class ReplaceAllApp:
             f"=== 完了 ({elapsed:.1f}秒)  "
             f"対象:{total_files}件  内容変更:{changed_files}件  "
             f"置換:{total_reps}箇所  名前変更:{renamed_files}件  "
-            f"PDF変換:{pdf_count}件  エラー:{error_count}件 ==="
+            f"PDF変換:{pdf_count}件  マスタ置換:{master_count}件  エラー:{error_count}件 ==="
         )
         self.root.after(0, lambda: self._log(summary, "head"))
         self.root.after(0, lambda: self.status_var.set(
-            f"完了 — 変更:{changed_files}/{total_files}  名前:{renamed_files}  PDF:{pdf_count}"))
+            f"完了 — 変更:{changed_files}/{total_files}  名前:{renamed_files}  PDF:{pdf_count}  マスタ:{master_count}"))
         self.root.after(0, lambda: self.run_btn.config(state=tk.NORMAL))
 
 
